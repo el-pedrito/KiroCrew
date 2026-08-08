@@ -272,6 +272,35 @@ export default function ChatPane({
     // response was lost, leaving this client in conflict with execution order.
     api.reorderQueuedMessages(slotKey, next).catch(() => undefined)
   }, [slotKey, allMessages, queuedMessages])
+  // Mirrors ChatPage's handleEditQueued. No client-side dispatch at all: the
+  // queue_edit WS broadcast - which this client also receives - is the single
+  // authoritative store update. Any local dispatch (optimistic or
+  // post-response) can race a concurrent edit: a delayed response committing
+  // after a later successful edit would overwrite newer content with stale
+  // text, diverging from the backend queue.
+  // Live view of this pane's queued cards for the edit-failure guard below:
+  // the .catch closure predates the WS echo, so it must read the CURRENT
+  // queue through a ref rather than the captured render's value.
+  const queuedRef = useRef(queuedMessages)
+  queuedRef.current = queuedMessages
+  const onEditQueued = useCallback((queueId: string, content: string) => {
+    const trimmed = content.trim()
+    if (!trimmed) return
+    api.editQueuedMessage(slotKey, queueId, trimmed).catch(() => {
+      // A rejected PATCH must not swallow the replacement text - but only
+      // when the edit truly did not land. On a transport-ambiguous failure
+      // (server committed, HTTP response lost) the authoritative queue_edit
+      // echo has typically already applied this edit; re-seeding the composer
+      // then would duplicate committed text. Skip the restore when the card
+      // already carries this exact edit.
+      const committed = queuedRef.current.some(m => (m.meta as any)?.queueId === queueId && m.content === trimmed)
+      if (committed) return
+      // Otherwise restore into this pane's composer (appending if the user
+      // typed something meanwhile) - the same recovery the failed-send path
+      // above uses. The card itself stays untouched.
+      setInput((prev) => (prev.trim() ? `${prev}\n${trimmed}` : trimmed))
+    })
+  }, [slotKey])
   // Split-view panes render tool calls with the full ToolCallLine (purpose / input /
   // output / live status) instead of the SDK's bare pill. ToolCallLine's slot-aware
   // selectors read THIS slot's per-slot tool log, so a background pane shows the same
@@ -337,7 +366,7 @@ export default function ChatPane({
 
         <SubagentDeliveryProgress count={systemDeliveryCount} />
         {queuedMessages.length > 0 && (
-          <QueueStack messages={queuedMessages} onCancel={onCancelQueued} onInterrupt={onInterruptQueued} onReorder={onReorderQueued} />
+          <QueueStack messages={queuedMessages} onCancel={onCancelQueued} onInterrupt={onInterruptQueued} onEdit={onEditQueued} onReorder={onReorderQueued} />
         )}
 
         {/* The pending ask_question card renders per pane: in split mode the
